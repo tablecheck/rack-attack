@@ -36,6 +36,7 @@ See the [Backing & Hacking blog post](https://www.kickstarter.com/backing-and-ha
   - [Cache store configuration](#cache-store-configuration)
 - [Customizing responses](#customizing-responses)
   - [RateLimit headers for well-behaved clients](#ratelimit-headers-for-well-behaved-clients)
+- [System Hardening](#system-hardening)
 - [Logging & Instrumentation](#logging--instrumentation)
 - [Testing](#testing)
 - [How it works](#how-it-works)
@@ -366,6 +367,90 @@ For responses that did not exceed a throttle limit, Rack::Attack annotates the e
 
 ```ruby
 request.env['rack.attack.throttle_data'][name] # => { discriminator: d, count: n, period: p, limit: l, epoch_time: t }
+```
+
+## System Hardening
+
+If your [cache store](#cache-store-configuration) goes down, it may cause severe latency
+within Rack::Attack and lead to an application outage.
+
+This section explains how to configure your application in order to mitigate issues.
+
+### Expose Rails cache errors to Rack::Attack
+
+If using Rails cache, by default, Rails cache will suppress any errors coming from the underlying cache store.
+You'll need to expose these errors to Rack::Attack with a custom error handler follows:
+
+```ruby
+# in your Rails config
+config.cache_store = :redis_cache_store,
+                     { # ...
+                       error_handler: -> (method:, returning:, exception:) do
+                         raise exception if Rack::Attack.calling?
+                       end }
+```
+
+By default, if a Redis or Dalli cache error occurs, Rack::Attack will consider the request "passed".
+
+### Configure cache timeout
+
+In your application config, set your cache timeout to a low value, for example, 0.1 seconds or lower.
+Please refer to the [Rails Guide](https://guides.rubyonrails.org/caching_with_rails.html).
+
+```ruby
+# Set 100 millisecond timeout on Redis
+config.cache_store = :redis_cache_store,
+                     { # ...
+                       connect_timeout: 0.1,
+                       read_timeout: 0.1,
+                       write_timeout: 0.1 }
+```
+
+It is also possible to [set a Rack::Attack-specific cache store configuration](#cache-store-configuration)
+if you'd like to use different timeout values than Rails cache.
+
+### Configure Rack::Attack failure cooldown
+
+When an error occurs, by default, Rack::Attack becomes disabled for a 60 seconds "cooldown" period.
+This prevents a cache failure adding latency on each request. You can configure the cooldown as follows:
+
+```ruby
+# in initializers/rack_attack.rb
+
+# Disable Rack::Attack for 5 minutes if your cache fails
+Rack::Attack.failure_cooldown = 500
+
+# Do not use failure cooldown
+Rack::Attack.failure_cooldown = nil
+```
+
+### Custom error handling
+
+By default, Rack::Attack will ignore any Redis or Dalli cache errors, and raise any other errors it receives.
+Note that ignored errors will still trigger the failure cooldown.
+
+```ruby
+# in initializers/rack_attack.rb
+Rack::Attack.ignored_errors << MyErrorClass
+```
+
+You can also define a custom error handler, which will receive all non-ignored errors.
+
+```ruby
+# Raise RuntimeErrors and trigger blocklist response for others
+Rack::Attack.error_handler = -> (error, request) do
+  raise(error) if error.is_a?(RuntimeError)
+  Rack::Attack.blocklisted_responder.call(request)
+end
+
+# Handle all errors with blocklist response
+Rack::Attack.error_handler = :blocklist
+
+# Handle all errors with throttle response
+Rack::Attack.error_handler = :throttle
+
+# Handle all errors by passing the request
+Rack::Attack.error_handler = :safelist
 ```
 
 ## Logging & Instrumentation
